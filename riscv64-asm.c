@@ -613,6 +613,7 @@ static void asm_binary_opcode(TCCState* s1, int token)
         imm.e.v = ((hi + 0x800) & 0xfffff000) >> 12;
         /* lui rd, HI_20(HI_32(imm)) */
         asm_emit_u(token, (0xD << 2) | 3, &ops[0], &imm);
+        asm_emit_u(token, (0xD << 2) | 3, &ops[0], &imm);
         /* addi rd, rd, LO_12(HI_32(imm)) */
         imm.e.v = (int32_t)hi<<20>>20;
         asm_emit_i(token, 3 | (4 << 2), &ops[0], &ops[0], &imm);
@@ -762,11 +763,103 @@ static void asm_emit_j(int token, uint32_t opcode, const Operand* rd, const Oper
     gen_le32(opcode | ENCODE_RD(rd->reg) | (((imm >> 20) & 1) << 31) | (((imm >> 1) & 0x3ff) << 21) | (((imm >> 11) & 1) << 20) | (((imm >> 12) & 0xff) << 12));
 }
 
+#define SP_REG 2  // Stack pointer register (x2)
+
+// Function to identify all registers that could flip into rs1
+void get_bitflip_registers(int rs1, int *regs, int *count) {
+    int reg;
+    *count = 0;
+
+    for (reg = 1; reg < 32; reg++) {  // Check all possible registers (x0-x31), skip 0
+        if (reg == rs1 || reg == 2) continue;         // Skip itself, skip sp
+
+        int flipped = rs1 ^ reg;          // XOR to find bit differences
+        if (__builtin_popcount(flipped) == 1) { // If only **one bit is different**
+            regs[(*count)++] = reg;
+        }
+    }
+}
+
+void mitigate_rowhammer(TCCState *s1, Operand *ops) {
+    int rs1, regs[5], count, i;
+
+    Operand sp_op, reg_op, offset_op, stack_adj_op, zero_reg, zero_imm;
+
+    rs1 = ops[1].reg;
+    get_bitflip_registers(rs1, regs, &count);
+    if (count == 0) return;
+
+    // Stack pointer operand
+    sp_op.type = OP_REG;
+    sp_op.reg  = SP_REG;
+
+    // Stack adjustment operand: -4 * count
+    stack_adj_op.type = OP_IM12S;
+    stack_adj_op.e.v  = -4 * count;
+
+    // Subtract stack space
+    asm_emit_i(TOK_ASM_addi, (4 << 2) | 3,
+               &sp_op, &sp_op, &stack_adj_op);  // sp -= 4 * count
+
+    // Define x0 register
+    zero_reg.type = OP_REG;
+    zero_reg.reg  = 0;  // x0 in RISC-V
+
+    // Define immediate zero
+    zero_imm.type = OP_IM12S;
+    zero_imm.e.v  = 0;
+
+    for (i = 0; i < count; i++) {
+        reg_op.type = OP_REG;
+        reg_op.reg  = regs[i];
+
+        offset_op.type = OP_IM12S;
+        offset_op.e.v  = i * 4;
+
+        // Save register to stack: sw reg, offset(sp)
+        asm_emit_s(TOK_ASM_sw, (0x8 << 2) | 3 | (2 << 12),
+                   &reg_op, &sp_op, &offset_op);
+
+        // Zero out register: addi reg, x0, 0
+        asm_emit_i(TOK_ASM_addi, (4 << 2) | 3,
+                   &reg_op, &zero_reg, &zero_imm);
+    }
+}
+
+// Restore correctly (don't overwrite registers with sp!)
+void restore_bitflip_registers(TCCState *s1, Operand *ops) {
+    int rs1, regs[5], count, i;
+    Operand sp_op, reg_op, offset_op, imm_op;
+
+    rs1 = ops[1].reg;
+    get_bitflip_registers(rs1, regs, &count);
+    
+    if (count == 0) return;
+
+    sp_op.type = 1;
+    sp_op.reg = SP_REG;
+
+    for (i = 0; i < count; i++) {
+        reg_op.type = 1;
+        reg_op.reg = regs[i];
+        offset_op.type = 2;
+        offset_op.e.v = i * 4;
+        
+        asm_emit_s(TOK_ASM_lw, (0x8 << 2) | 3 | (2 << 12), &reg_op, &sp_op, &offset_op);  // Restore reg
+    }
+
+    imm_op.type = 2;
+    imm_op.e.v = 4 * count;
+    asm_emit_i(TOK_ASM_addi, (0x0 << 2) | 19, &sp_op, &sp_op, &imm_op);  // sp += 4 * count
+}
+
+
 static void asm_mem_access_opcode(TCCState *s1, int token)
 {
 
     Operand ops[3];
     parse_mem_access_operands(s1, &ops[0]);
+
 
     /* Pseudoinstruction: inst reg, label
      * expand to:
@@ -792,8 +885,11 @@ static void asm_mem_access_opcode(TCCState *s1, int token)
          asm_emit_i(token, (0x0 << 2) | 3 | (1 << 12), &ops[0], &ops[1], &ops[2]);
          return;
     case TOK_ASM_lw:
-         asm_emit_i(token, (0x0 << 2) | 3 | (2 << 12), &ops[0], &ops[1], &ops[2]);
-         return;
+
+        mitigate_rowhammer(s1, &ops[1]);  // Fix argument type (now passing `Operand *`)
+        asm_emit_i(token, (0x0 << 2) | 3 | (2 << 12), &ops[0], &ops[1], &ops[2]);
+        restore_bitflip_registers(s1, &ops[1]);  // Fix argument type
+        return;
     case TOK_ASM_ld:
          asm_emit_i(token, (0x0 << 2) | 3 | (3 << 12), &ops[0], &ops[1], &ops[2]);
          return;
@@ -1434,7 +1530,8 @@ ST_FUNC void asm_opcode(TCCState *s1, int token)
     case TOK_ASM_neg:
     case TOK_ASM_negw:
         asm_binary_opcode(s1, token);
-        return;
+            // TODO: show how easy it it to change TinyC!
+        return; 
 
     case TOK_ASM_bnez:
     case TOK_ASM_beqz:
