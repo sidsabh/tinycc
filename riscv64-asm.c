@@ -766,28 +766,26 @@ static void asm_emit_j(int token, uint32_t opcode, const Operand* rd, const Oper
 #define SP_REG 2  // Stack pointer register (x2)
 
 // Function to identify all registers that could flip into rs1
-void get_bitflip_registers(int rs1, int *regs, int *count) {
-    int reg, flipped;
-    *count = 0;
+void get_bitflip_registers(int reg, int* reg_neighbors, int* reg_neighbor_count) {
+    int flipped = 0;
+    *reg_neighbor_count = 0;
 
-    for (reg = 1; reg < 32; reg++) {  // Check all possible registers (x0-x31), skip 0
-        if (reg == rs1 || reg == 2) continue;         // Skip itself, skip sp
+    for (int r = 1; r < 32; r++) {  // Check all possible registers (x0-x31), skip 0
+        if (reg == r || r == SP_REG) continue;         // Skip itself, skip sp
 
-        flipped = rs1 ^ reg;          // XOR to find bit differences
+        flipped = reg ^ r;          // XOR to find bit differences
         if (__builtin_popcount(flipped) == 1) { // If only **one bit is different**
-            regs[(*count)++] = reg;
+            reg_neighbors[(*reg_neighbor_count)++] = r;
         }
     }
 }
 
-void mitigate_rowhammer(TCCState *s1, Operand *ops) {
-    int rs1, regs[5], count, i;
+void save_nearby_registers(int reg){
+    int reg_neighbors[5], reg_neighbor_count;
 
     Operand sp_op, reg_op, offset_op, stack_adj_op, zero_reg, zero_imm;
-
-    rs1 = ops[1].reg;
-    get_bitflip_registers(rs1, regs, &count);
-    if (count == 0) return;
+    get_bitflip_registers(reg, reg_neighbors, &reg_neighbor_count);
+    if (reg_neighbor_count == 0) return;
 
     // Stack pointer operand
     sp_op.type = OP_REG;
@@ -795,7 +793,7 @@ void mitigate_rowhammer(TCCState *s1, Operand *ops) {
 
     // Stack adjustment operand: -4 * count
     stack_adj_op.type = OP_IM12S;
-    stack_adj_op.e.v  = -4 * count;
+    stack_adj_op.e.v  = -4 * reg_neighbor_count;
 
     // Subtract stack space
     asm_emit_i(TOK_ASM_addi, (4 << 2) | 3,
@@ -809,9 +807,9 @@ void mitigate_rowhammer(TCCState *s1, Operand *ops) {
     zero_imm.type = OP_IM12S;
     zero_imm.e.v  = 0;
 
-    for (i = 0; i < count; i++) {
+    for (int i = 0; i < reg_neighbor_count; i++) {
         reg_op.type = OP_REG;
-        reg_op.reg  = regs[i];
+        reg_op.reg  = reg_neighbors[i];
 
         offset_op.type = OP_IM12S;
         offset_op.e.v  = i * 4;
@@ -825,33 +823,33 @@ void mitigate_rowhammer(TCCState *s1, Operand *ops) {
                    &reg_op, &zero_reg, &zero_imm);
     }
 }
- // Restore correctly (don't overwrite registers with sp!)
- void restore_bitflip_registers(TCCState *s1, Operand *ops) {
-     int rs1, regs[5], count, i;
-     Operand sp_op, reg_op, offset_op, imm_op;
 
-     rs1 = ops[1].reg;
-     get_bitflip_registers(rs1, regs, &count);
+void restore_nearby_registers(int reg){
+    int reg_neighbors[5], reg_neighbor_count;
+    Operand sp_op, reg_op, offset_op, imm_op;
 
-     if (count == 0) return;
+    get_bitflip_registers(reg, reg_neighbors, &reg_neighbor_count);
+
+    if (reg_neighbor_count == 0) return;
 
     sp_op.type = OP_REG;
-     sp_op.reg = SP_REG;
+    sp_op.reg = SP_REG;
 
-     for (i = 0; i < count; i++) {
+    for (int i = 0; i < reg_neighbor_count; i++) {
         reg_op.type = OP_REG;
-        reg_op.reg  = regs[i];
+        reg_op.reg  = reg_neighbors[i];
         offset_op.type = OP_IM12S;
-         offset_op.e.v = i * 4;
+        offset_op.e.v = i * 4;
 
-         asm_emit_i(TOK_ASM_lw, (0x0 << 2) | 3 | (2 << 12), &reg_op, &sp_op, &offset_op);  // Restore reg
+        asm_emit_i(TOK_ASM_lw, (0x0 << 2) | 3 | (2 << 12), &reg_op, &sp_op, &offset_op);  // Restore reg
 
-     }
+    }
 
-     imm_op.type = 2;
-     imm_op.e.v = 4 * count;
-     asm_emit_i(TOK_ASM_addi, (0x0 << 2) | 19, &sp_op, &sp_op, &imm_op);  // sp += 4 * count
- }
+    imm_op.type = 2;
+    imm_op.e.v = 4 * reg_neighbor_count;
+    asm_emit_i(TOK_ASM_addi, (0x0 << 2) | 19, &sp_op, &sp_op, &imm_op);  // sp += 4 * count
+}
+
 static void asm_mem_access_opcode(TCCState *s1, int token)
 {
 
@@ -883,10 +881,9 @@ static void asm_mem_access_opcode(TCCState *s1, int token)
          asm_emit_i(token, (0x0 << 2) | 3 | (1 << 12), &ops[0], &ops[1], &ops[2]);
          return;
     case TOK_ASM_lw:
-
-        mitigate_rowhammer(s1, ops);  // Fix argument type (now passing `Operand *`)
+        save_nearby_registers(ops[1].reg);
         asm_emit_i(token, (0x0 << 2) | 3 | (2 << 12), &ops[0], &ops[1], &ops[2]);
-        restore_bitflip_registers(s1, ops);  // Fix argument type
+        restore_nearby_registers(ops[1].reg); 
         return;
     case TOK_ASM_ld:
          asm_emit_i(token, (0x0 << 2) | 3 | (3 << 12), &ops[0], &ops[1], &ops[2]);
