@@ -850,6 +850,32 @@ void restore_nearby_registers(int reg){
     asm_emit_i(TOK_ASM_addi, (0x0 << 2) | 19, &sp_op, &sp_op, &imm_op);  // sp += 4 * count
 }
 
+void verify_nearby_rd_unchanged(int reg){
+    int reg_neighbors[5], reg_neighbor_count;
+    Operand reg_op;
+    Operand instr_offset_op = {.type=OP_IM12S, .e.v=8}; 
+    Operand zero_reg = {.type=OP_REG, .reg=0};
+    Operand zero_reg_offset = {.type=OP_IM12S, .e.v=0};
+
+    get_bitflip_registers(reg, reg_neighbors, &reg_neighbor_count);
+
+    if (reg_neighbor_count == 0) return;
+
+    for (int i = 0; i < reg_neighbor_count; i++) {
+        reg_op.type = OP_REG;
+        reg_op.reg  = reg_neighbors[i];
+
+        // CHECK nearby rds is 0
+        /*
+        beq <neighbor-reg>, x0, 8              # Jump 8 bytes (or 2 instructions) ahead if correcly 0
+        lw <neighbor-reg>, 0(x0)               # instruction guaranteed to fault
+        */
+        asm_emit_b(TOK_ASM_beq, 0x63 | (0 << 12), &reg_op, &zero_reg, &instr_offset_op);
+        asm_emit_i(TOK_ASM_lw, (0x0 << 2) | 3 | (2 << 12), &reg_op, &zero_reg, &zero_reg_offset);
+    }
+}
+
+
 static void asm_mem_access_opcode(TCCState *s1, int token)
 {
 
@@ -881,9 +907,12 @@ static void asm_mem_access_opcode(TCCState *s1, int token)
          asm_emit_i(token, (0x0 << 2) | 3 | (1 << 12), &ops[0], &ops[1], &ops[2]);
          return;
     case TOK_ASM_lw:
+        save_nearby_registers(ops[0].reg);
         save_nearby_registers(ops[1].reg);
         asm_emit_i(token, (0x0 << 2) | 3 | (2 << 12), &ops[0], &ops[1], &ops[2]);
-        restore_nearby_registers(ops[1].reg); 
+        verify_nearby_rd_unchanged(ops[0].reg);
+        restore_nearby_registers(ops[1].reg);
+        restore_nearby_registers(ops[0].reg); 
         return;
     case TOK_ASM_ld:
          asm_emit_i(token, (0x0 << 2) | 3 | (3 << 12), &ops[0], &ops[1], &ops[2]);
