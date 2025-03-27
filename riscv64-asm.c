@@ -824,6 +824,37 @@ void save_nearby_registers(int reg){
     }
 }
 
+void copy_nearby_registers(int reg){
+    int reg_neighbors[5], reg_neighbor_count;
+
+    Operand target_reg = {.type=OP_REG, .reg=reg}; // x0 
+    Operand zero_imm = {.type=OP_IM12S, .e.v=0}; // Define immediate zero
+    Operand sp_op = {.type=OP_REG, .reg=SP_REG}; // Stack pointer operand
+    Operand stack_adj_op = {.type=OP_IM12S, .e.v= 0};
+    Operand reg_op = {.type=OP_REG, .reg=0}; // initialize to zero reg, but will change later
+    Operand offset_op = {.type=OP_IM12S, .e.v=0}; // initialize to 0, but will change later
+    
+    get_bitflip_registers(reg, reg_neighbors, &reg_neighbor_count);
+    if (reg_neighbor_count == 0) return;
+
+    // Stack adjustment operand: -4 * count
+    stack_adj_op.e.v= -4 * reg_neighbor_count; 
+
+    // Subtract stack space
+    asm_emit_i(TOK_ASM_addi, (4 << 2) | 3, &sp_op, &sp_op, &stack_adj_op);  // sp -= 4 * count
+
+    for (int i = 0; i < reg_neighbor_count; i++) {
+        reg_op.reg  = reg_neighbors[i];
+        offset_op.e.v  = i * 4;
+
+        // Save register to stack: sw reg, offset(sp)
+        asm_emit_s(TOK_ASM_sw, (0x8 << 2) | 3 | (2 << 12), &sp_op, &reg_op, &offset_op);
+
+        // Copy target reg value out register: addi neigh_reg, target_reg, 0
+        asm_emit_i(TOK_ASM_addi, (4 << 2) | 3, &reg_op, &target_reg, &zero_imm);
+    }
+}
+
 void restore_nearby_registers(int reg){
     int reg_neighbors[5], reg_neighbor_count;
     Operand sp_op, reg_op, offset_op, imm_op;
@@ -1060,7 +1091,9 @@ static void asm_ternary_opcode(TCCState *s1, int token)
          asm_emit_r(token, (0xC << 2) | 3, &ops[0], &ops[1], &ops[2]);
          return;
     case TOK_ASM_addi:
+         copy_nearby_registers(ops[1].reg);
          asm_emit_i(token, (4 << 2) | 3, &ops[0], &ops[1], &ops[2]);
+         restore_nearby_registers(ops[1].reg);
          return;
     case TOK_ASM_sub:
          asm_emit_r(token, (0xC << 2) | 3 | (32 << 25), &ops[0], &ops[1], &ops[2]);
